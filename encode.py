@@ -51,7 +51,7 @@ def calculate_similarity_score(img_path1, img_path2):
     try:
         with Image.open(img_path1) as img1, Image.open(img_path2) as img2:
             if img1.size != img2.size or img1.mode != img2.mode:
-                img2 = img2.resize(img1.size).convert(img1.mode)
+                return -1
             
             diff = ImageChops.difference(img1, img2)
             diff_arr = np.array(diff.convert('L'))
