@@ -11,6 +11,7 @@ typedef struct {
     gchar *zip_path;
     GHashTable *image_map;
     GHashTable *dependencies;
+    GHashTable *alpha_map;
     GdkPixbuf *original_pixbuf;
 } AppData;
 
@@ -18,6 +19,8 @@ static void debug_print_stored_data(AppData *data);
 static GdkPixbuf* render_composite_image(AppData *data, const gchar *image_id, GError **error);
 static gchar* read_file_from_zip(const char *zip_path, const char *inner_filename, gsize *size, GError **error);
 static GdkPixbuf* load_pixbuf_from_memory(const gchar *buffer, gsize size, GError **error);
+static GdkPixbuf* load_alpha_for_id(AppData *data, const gchar *image_id, GError **error);
+static gboolean apply_alpha_map_to_pixbuf(GdkPixbuf *pixbuf, GdkPixbuf *alpha_map_pixbuf, gboolean combine_with_existing, GError **error);
 static void activate(GtkApplication *app, gpointer user_data);
 static int on_command_line(GtkApplication *app, GApplicationCommandLine *cmdline, gpointer user_data);
 static void on_row_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_data);
@@ -37,6 +40,7 @@ int main(int argc, char **argv) {
     g_free(data->zip_path);
     if (data->image_map) g_hash_table_destroy(data->image_map);
     if (data->dependencies) g_hash_table_destroy(data->dependencies);
+    if (data->alpha_map) g_hash_table_destroy(data->alpha_map);
     if (data->original_pixbuf) g_object_unref(data->original_pixbuf);
     g_free(data);
     return status;
@@ -72,6 +76,12 @@ static void debug_print_stored_data(AppData *data) {
     g_hash_table_iter_init(&iter, data->dependencies);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
         g_print("  ID '%s' -> Depends on '%s'\n", (gchar*)key, (gchar*)value);
+    }
+
+    g_print("--- Alpha Map ---\n");
+    g_hash_table_iter_init(&iter, data->alpha_map);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        g_print("  ID '%s' -> Alpha file '%s'\n", (gchar*)key, (gchar*)value);
     }
     g_print("--- END OF VERIFICATION ---\n\n");
 }
@@ -124,6 +134,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
 
     data->image_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     data->dependencies = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    data->alpha_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 
     g_print("EXTRACTING data from temporary JSON object into permanent hash tables...\n");
     
@@ -138,6 +149,13 @@ static void activate(GtkApplication *app, gpointer user_data) {
         JsonObject *temp_deps = json_object_get_object_member(root_obj, "dependencies");
         if (temp_deps) {
             json_object_foreach_member(temp_deps, copy_to_hashtable_cb, data->dependencies);
+        }
+    }
+
+    if (json_object_has_member(root_obj, "alpha_map")) {
+        JsonObject *temp_alpha = json_object_get_object_member(root_obj, "alpha_map");
+        if (temp_alpha) {
+            json_object_foreach_member(temp_alpha, copy_to_hashtable_cb, data->alpha_map);
         }
     }
     
@@ -288,6 +306,18 @@ static GdkPixbuf* render_composite_image(AppData *data, const gchar *image_id, G
         g_object_unref(canvas_pixbuf);
         canvas_pixbuf = temp;
     }
+
+    GdkPixbuf *base_alpha_pixbuf = load_alpha_for_id(data, base_id, error);
+    if (base_alpha_pixbuf) {
+        if (!apply_alpha_map_to_pixbuf(canvas_pixbuf, base_alpha_pixbuf, FALSE, error)) {
+            g_object_unref(base_alpha_pixbuf);
+            g_free(base_id);
+            g_queue_free_full(chain, g_free);
+            g_object_unref(canvas_pixbuf);
+            return NULL;
+        }
+        g_object_unref(base_alpha_pixbuf);
+    }
     
     g_free(base_id);
     
@@ -328,6 +358,8 @@ static GdkPixbuf* render_composite_image(AppData *data, const gchar *image_id, G
             temp_alpha_pixbuf = gdk_pixbuf_add_alpha(overlay_to_composite, FALSE, 0, 0, 0);
             overlay_to_composite = temp_alpha_pixbuf;
         }
+
+        g_autoptr(GdkPixbuf) overlay_alpha_pixbuf = load_alpha_for_id(data, overlay_id, error);
         
         int canvas_width = gdk_pixbuf_get_width(canvas_pixbuf);
         int canvas_height = gdk_pixbuf_get_height(canvas_pixbuf);
@@ -342,6 +374,15 @@ static GdkPixbuf* render_composite_image(AppData *data, const gchar *image_id, G
             gdk_pixbuf_composite(overlay_to_composite, canvas_pixbuf,
                                0, 0, composite_width, composite_height,
                                0, 0, 1.0, 1.0, GDK_INTERP_NEAREST, 255);
+        }
+
+        if (overlay_alpha_pixbuf) {
+            if (!apply_alpha_map_to_pixbuf(canvas_pixbuf, overlay_alpha_pixbuf, TRUE, error)) {
+                g_free(overlay_id);
+                g_object_unref(canvas_pixbuf);
+                g_queue_free_full(chain, g_free);
+                return NULL;
+            }
         }
         
         g_free(overlay_id);
@@ -416,6 +457,65 @@ static GdkPixbuf* load_pixbuf_from_memory(const gchar *buffer, gsize size, GErro
         g_object_ref(pixbuf);
     }
     return pixbuf;
+}
+
+static GdkPixbuf* load_alpha_for_id(AppData *data, const gchar *image_id, GError **error) {
+    if (!data->alpha_map) return NULL;
+
+    const gchar *alpha_path = g_hash_table_lookup(data->alpha_map, image_id);
+    if (!alpha_path) return NULL;
+
+    gsize alpha_size = 0;
+    g_autofree gchar *alpha_buffer = read_file_from_zip(data->zip_path, alpha_path, &alpha_size, error);
+    if (!alpha_buffer) return NULL;
+
+    GdkPixbuf *alpha_pixbuf = load_pixbuf_from_memory(alpha_buffer, alpha_size, error);
+    return alpha_pixbuf;
+}
+
+static gboolean apply_alpha_map_to_pixbuf(GdkPixbuf *pixbuf, GdkPixbuf *alpha_map_pixbuf, gboolean combine_with_existing, GError **error) {
+    if (!pixbuf || !alpha_map_pixbuf) return FALSE;
+
+    int w = gdk_pixbuf_get_width(pixbuf);
+    int h = gdk_pixbuf_get_height(pixbuf);
+    int aw = gdk_pixbuf_get_width(alpha_map_pixbuf);
+    int ah = gdk_pixbuf_get_height(alpha_map_pixbuf);
+
+    if (w != aw || h != ah) {
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Alpha map size mismatch (%dx%d vs %dx%d)", aw, ah, w, h);
+        return FALSE;
+    }
+
+    if (!gdk_pixbuf_get_has_alpha(pixbuf)) {
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Target pixbuf missing alpha channel");
+        return FALSE;
+    }
+
+    int rowstride = gdk_pixbuf_get_rowstride(pixbuf);
+    int alpha_rowstride = gdk_pixbuf_get_rowstride(alpha_map_pixbuf);
+    int n_channels = gdk_pixbuf_get_n_channels(pixbuf);
+    int alpha_channels = gdk_pixbuf_get_n_channels(alpha_map_pixbuf);
+
+    guchar *pixels = gdk_pixbuf_get_pixels(pixbuf);
+    guchar *alpha_pixels = gdk_pixbuf_get_pixels(alpha_map_pixbuf);
+
+    for (int y = 0; y < h; y++) {
+        guchar *row = pixels + y * rowstride;
+        guchar *alpha_row = alpha_pixels + y * alpha_rowstride;
+        for (int x = 0; x < w; x++) {
+            guchar *p = row + x * n_channels;
+            guchar a_existing = p[3];
+            guchar a_map = alpha_row[x * alpha_channels];
+            if (combine_with_existing) {
+                // Combine delta mask alpha with original alpha map
+                p[3] = (guchar)((a_existing * a_map) / 255);
+            } else {
+                p[3] = a_map;
+            }
+        }
+    }
+
+    return TRUE;
 }
 
 // Image Scaling

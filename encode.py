@@ -19,6 +19,35 @@ import numpy as np
 
 IMAGE_EXTENSIONS = {'.png'}
 
+def image_has_alpha(image_path):
+    try:
+        with Image.open(image_path) as img:
+            has_alpha_channel = img.mode in {"RGBA", "LA"} or (img.mode == "P" and "transparency" in img.info)
+            if not has_alpha_channel:
+                return False
+            alpha_values = np.array(img.convert("RGBA").getchannel("A"), dtype=np.uint8)
+            return bool(np.any(alpha_values != 255))
+    except Exception:
+        return False
+
+def extract_and_save_alpha(img_path, alpha_save_path):
+    try:
+        alpha_save_path.parent.mkdir(parents=True, exist_ok=True)
+        with Image.open(img_path) as img:
+            alpha_channel = img.convert('RGBA').getchannel('A')
+            alpha_array = np.array(alpha_channel, dtype=np.uint8)
+            width, height = alpha_channel.size
+            data = alpha_array.tobytes()
+            color_type = oxipng.ColorType.grayscale()
+            raw = oxipng.RawImage(data, width, height, color_type=color_type)
+            optimized = raw.create_optimized_png(level=6, optimize_alpha=False)
+            with open(alpha_save_path, "wb") as f:
+                f.write(optimized)
+        return True
+    except Exception as e:
+        print(f"Error saving alpha for {img_path}: {e}")
+        return False
+
 class DisjointSetUnion:
     """A simple Disjoint Set Union (DSU) or Union-Find data structure."""
     def __init__(self, items):
@@ -61,7 +90,7 @@ def calculate_similarity_score(img_path1, img_path2):
     except Exception:
         return -1
 
-def process_image(current_img_path, base_img_path, output_path):
+def process_image(current_img_path, base_img_path, output_path, alpha_save_path=None):
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with Image.open(current_img_path) as img_current, Image.open(base_img_path) as img_base:
@@ -69,6 +98,8 @@ def process_image(current_img_path, base_img_path, output_path):
             del img_current
             img_base_rgb = img_base.convert('RGB')
             del img_base
+            if alpha_save_path is not None:
+                extract_and_save_alpha(current_img_path, alpha_save_path)
             diff = ImageChops.difference(img_current_rgb, img_base_rgb)
             del img_base_rgb
             mask = diff.convert('L').point(lambda p: 255 if p > 0 else 0)
@@ -133,6 +164,7 @@ def main():
 
         path_to_id = {path: str(i) for i, path in enumerate(image_paths_rel)}
         id_to_path = {str(i): path for i, path in enumerate(image_paths_rel)}
+        alpha_image_ids = [img_id for img_id, rel_path in id_to_path.items() if image_has_alpha(input_dir / rel_path)]
 
         print(f"Found {len(image_paths_rel)} images. Starting Phase 1: Scoring all pairs...")
         all_pairs = list(combinations(image_paths_rel, 2))
@@ -182,7 +214,15 @@ def main():
                             dependencies_by_id[child_id] = parent_id
                             q.append(child_id)
 
-        map_data = {"image_map": id_to_path, "root_images": sorted(root_image_ids, key=int), "dependencies": dependencies_by_id}
+        alpha_dir = output_dir / "alpha"
+        alpha_map = {img_id: str(Path("alpha") / id_to_path[img_id]) for img_id in alpha_image_ids}
+
+        map_data = {
+            "image_map": id_to_path,
+            "root_images": sorted(root_image_ids, key=int),
+            "dependencies": dependencies_by_id,
+            "alpha_map": alpha_map,
+        }
         map_file_path = output_dir / "optimization_map.json"
         with open(map_file_path, 'w', encoding='utf-8') as f:
             json.dump(map_data, f, indent=2, sort_keys=True, ensure_ascii=False)
@@ -194,12 +234,17 @@ def main():
             dest_path = output_dir / root_path_rel
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(input_dir / root_path_rel, dest_path)
+            if root_id in alpha_image_ids:
+                extract_and_save_alpha(input_dir / root_path_rel, alpha_dir / root_path_rel)
         
         total_to_process = len(dependencies_by_id) + len(root_image_ids)
         processed_count = len(root_image_ids)
         print_progress_bar(processed_count, total_to_process, prefix='Phase 2/2:', suffix='Processing')
         with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = {executor.submit(process_image, input_dir / id_to_path[cid], input_dir / id_to_path[pid], output_dir / id_to_path[cid]): cid for cid, pid in dependencies_by_id.items()}
+            futures = {}
+            for cid, pid in dependencies_by_id.items():
+                alpha_save_path = alpha_dir / id_to_path[cid] if cid in alpha_image_ids else None
+                futures[executor.submit(process_image, input_dir / id_to_path[cid], input_dir / id_to_path[pid], output_dir / id_to_path[cid], alpha_save_path)] = cid
             for future in as_completed(futures):
                 if future.result():
                     processed_count += 1
