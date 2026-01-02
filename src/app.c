@@ -1,5 +1,74 @@
 #include "viewer.h"
-#include <ctype.h>
+
+// Simple natural comparator: compares sequences of digits numerically, otherwise lexicographically (ASCII)
+static int natural_cmp(const char *a, const char *b) {
+    const unsigned char *s1 = (const unsigned char*)a;
+    const unsigned char *s2 = (const unsigned char*)b;
+    while (*s1 && *s2) {
+        if (g_ascii_isdigit(*s1) && g_ascii_isdigit(*s2)) {
+            // skip leading zeros
+            while (*s1 == '0') s1++;
+            while (*s2 == '0') s2++;
+            const unsigned char *p1 = s1;
+            const unsigned char *p2 = s2;
+            while (g_ascii_isdigit(*p1)) p1++;
+            while (g_ascii_isdigit(*p2)) p2++;
+            int len1 = p1 - s1;
+            int len2 = p2 - s2;
+            if (len1 != len2) return len1 - len2;
+            int cmp = g_ascii_strncasecmp((const char*)s1, (const char*)s2, len1);
+            if (cmp != 0) return cmp;
+            s1 = p1;
+            s2 = p2;
+            continue;
+        }
+        if (*s1 != *s2) return (int)*s1 - (int)*s2;
+        s1++; s2++;
+    }
+    return (int)*s1 - (int)*s2;
+}
+
+static GtkTreeIter* append_path(GtkTreeStore *store, GHashTable *node_map, const char *path, const char *id_str) {
+    // node_map keyed by full path segment, value GtkTreeIter*
+    gchar **parts = g_strsplit(path, "/", -1);
+    if (!parts) return NULL;
+    gchar *accum = g_strdup("");
+    GtkTreeIter *parent_iter = NULL;
+    for (int i = 0; parts[i] != NULL; i++) {
+        gboolean is_leaf = parts[i+1] == NULL;
+        gchar *prev = accum;
+        accum = g_strconcat(accum[0] ? accum : "", accum[0] ? "/" : "", parts[i], NULL);
+        g_free(prev);
+        GtkTreeIter *existing = g_hash_table_lookup(node_map, accum);
+        if (!existing) {
+            GtkTreeIter *iter = g_new0(GtkTreeIter, 1);
+            gtk_tree_store_append(store, iter, parent_iter);
+            gtk_tree_store_set(store, iter, 0, is_leaf ? id_str : NULL, 1, parts[i], -1);
+            g_hash_table_insert(node_map, g_strdup(accum), iter);
+            existing = iter;
+        }
+        parent_iter = existing;
+    }
+    g_strfreev(parts);
+    g_free(accum);
+    return parent_iter;
+}
+
+static gboolean find_iter_for_id(GtkTreeModel *model, GtkTreePath *path, GtkTreeIter *iter, gpointer user_data) {
+    const gchar *target_id = (const gchar*)user_data;
+    gchar *id = NULL;
+    gtk_tree_model_get(model, iter, 0, &id, -1);
+    gboolean stop = FALSE;
+    if (id && target_id && g_strcmp0(id, target_id) == 0) {
+        GtkTreePath **out_path = (GtkTreePath**)g_object_get_data(G_OBJECT(model), "find_path_ptr");
+        if (out_path) {
+            *out_path = gtk_tree_path_copy(path);
+        }
+        stop = TRUE;
+    }
+    g_free(id);
+    return stop;
+}
 
 static void copy_to_hashtable_cb(JsonObject *object, const gchar *member_name, JsonNode *member_node, gpointer user_data) {
     GHashTable *hash_table = (GHashTable*)user_data;
@@ -39,59 +108,6 @@ void debug_print_stored_data(AppData *data) {
         g_print("  ID '%s' -> Alpha file '%s'\n", (gchar*)key, (gchar*)value);
     }
     g_print("--- END OF VERIFICATION ---\n\n");
-}
-
-static gint natural_compare_strings(const gchar *a, const gchar *b) {
-    const gchar *p = a;
-    const gchar *q = b;
-    while (*p && *q) {
-        if (g_ascii_isdigit(*p) && g_ascii_isdigit(*q)) {
-            const gchar *p_start = p;
-            const gchar *q_start = q;
-
-            while (*p_start == '0') p_start++;
-            while (*q_start == '0') q_start++;
-
-            const gchar *p_end = p_start;
-            const gchar *q_end = q_start;
-            while (g_ascii_isdigit(*p_end)) p_end++;
-            while (g_ascii_isdigit(*q_end)) q_end++;
-
-            gint len_p = p_end - p_start;
-            gint len_q = q_end - q_start;
-            if (len_p != len_q)
-                return (len_p < len_q) ? -1 : 1;
-
-            gint cmp = g_strndup(p_start, len_p) ? memcmp(p_start, q_start, len_p) : 0;
-            if (cmp != 0)
-                return (cmp < 0) ? -1 : 1;
-
-            /* numbers equal, advance pointers past the digit sequences */
-            p = p_end;
-            q = q_end;
-            continue;
-        }
-
-        gint ca = g_ascii_tolower(*p);
-        gint cb = g_ascii_tolower(*q);
-        if (ca != cb)
-            return (ca < cb) ? -1 : 1;
-        p++;
-        q++;
-    }
-    if (!*p && !*q) return 0;
-    return (*p) ? 1 : -1;
-}
-
-static gint natural_compare(gconstpointer a, gconstpointer b, gpointer user_data) {
-    const gchar *id_a = (const gchar*)a;
-    const gchar *id_b = (const gchar*)b;
-    GHashTable *map = (GHashTable*)user_data;
-    const gchar *fa = g_hash_table_lookup(map, id_a);
-    const gchar *fb = g_hash_table_lookup(map, id_b);
-    if (!fa) fa = id_a;
-    if (!fb) fb = id_b;
-    return natural_compare_strings(fa, fb);
 }
 
 int on_command_line(GtkApplication *app, GApplicationCommandLine *cmdline, gpointer user_data) {
@@ -195,8 +211,64 @@ void activate(GtkApplication *app, gpointer user_data) {
     gtk_container_add(GTK_CONTAINER(data->main_window), paned);
     
     GtkWidget *scrolled_list = gtk_scrolled_window_new(NULL, NULL);
-    GtkWidget *list_box = gtk_list_box_new();
-    gtk_container_add(GTK_CONTAINER(scrolled_list), list_box);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled_list), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+
+    GtkTreeStore *store = gtk_tree_store_new(2, G_TYPE_STRING, G_TYPE_STRING); // id, label
+    GHashTable *node_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+
+    GList *id_list = g_hash_table_get_keys(data->image_map);
+    // Build auxiliary list of (path,id) to sort naturally by path
+    GList *path_list = NULL;
+    for (GList *l = id_list; l; l = l->next) {
+        const gchar *image_id = l->data;
+        const gchar *filename = g_hash_table_lookup(data->image_map, image_id);
+        if (filename) {
+            path_list = g_list_prepend(path_list, g_strdup_printf("%s\t%s", filename, image_id));
+        }
+    }
+    path_list = g_list_sort(path_list, (GCompareFunc)natural_cmp);
+
+    gchar *first_id = NULL;
+    for (GList *l = path_list; l; l = l->next) {
+        gchar **parts = g_strsplit(l->data, "\t", 2);
+        if (parts && parts[0] && parts[1]) {
+            append_path(store, node_map, parts[0], parts[1]);
+            if (!first_id) first_id = g_strdup(parts[1]);
+        }
+        g_strfreev(parts);
+    }
+
+    g_hash_table_destroy(node_map);
+    g_list_free_full(path_list, g_free);
+    g_list_free(id_list);
+
+    GtkWidget *tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
+    g_object_unref(store);
+    GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+    GtkTreeViewColumn *column = gtk_tree_view_column_new_with_attributes("Images", renderer, "text", 1, NULL);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), column);
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(tree), FALSE);
+
+    GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree));
+    gtk_tree_selection_set_mode(selection, GTK_SELECTION_BROWSE);
+    g_signal_connect(selection, "changed", G_CALLBACK(on_tree_selection_changed), data);
+
+    gtk_tree_view_expand_all(GTK_TREE_VIEW(tree));
+    if (first_id) {
+        GtkTreePath *found_path = NULL;
+        g_object_set_data(G_OBJECT(gtk_tree_view_get_model(GTK_TREE_VIEW(tree))), "find_path_ptr", &found_path);
+        gtk_tree_model_foreach(gtk_tree_view_get_model(GTK_TREE_VIEW(tree)), find_iter_for_id, (gpointer)first_id);
+        if (found_path) {
+            gtk_tree_selection_select_path(selection, found_path);
+            gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(tree), found_path, NULL, FALSE, 0, 0);
+            gtk_tree_path_free(found_path);
+        }
+        g_object_set_data(G_OBJECT(gtk_tree_view_get_model(GTK_TREE_VIEW(tree))), "find_path_ptr", NULL);
+    }
+
+    g_free(first_id);
+
+    gtk_container_add(GTK_CONTAINER(scrolled_list), tree);
     gtk_paned_add1(GTK_PANED(paned), scrolled_list);
     
     GtkWidget *scrolled_image = gtk_scrolled_window_new(NULL, NULL);
@@ -218,21 +290,6 @@ void activate(GtkApplication *app, gpointer user_data) {
     gtk_paned_add2(GTK_PANED(paned), scrolled_image);
     gtk_paned_set_position(GTK_PANED(paned), 200);
 
-    GList *id_list = g_hash_table_get_keys(data->image_map);
-    id_list = g_list_sort_with_data(id_list, (GCompareDataFunc)natural_compare, data->image_map);
-    
-    for (GList *l = id_list; l != NULL; l = l->next) {
-        const gchar *image_id = (const gchar*)l->data;
-        const gchar *filename = g_hash_table_lookup(data->image_map, image_id);
-        
-        GtkWidget *row = gtk_list_box_row_new();
-        gtk_container_add(GTK_CONTAINER(row), gtk_label_new(filename ? filename : image_id));
-        g_object_set_data_full(G_OBJECT(row), "image-id", g_strdup(image_id), g_free);
-        gtk_list_box_insert(GTK_LIST_BOX(list_box), row, -1);
-    }
-    g_list_free(id_list);
-
-    g_signal_connect(list_box, "row-selected", G_CALLBACK(on_row_selected), data);
     gtk_widget_show_all(data->main_window);
     gtk_widget_hide(data->spinner);
 }

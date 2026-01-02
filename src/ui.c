@@ -1,14 +1,22 @@
 #include "viewer.h"
 
-void on_row_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_data) {
+void on_tree_selection_changed(GtkTreeSelection *selection, gpointer user_data) {
     AppData *data = (AppData*)user_data;
-    if (row == NULL) return;
-    
+    GtkTreeModel *model = NULL;
+    GtkTreeIter iter;
+    if (!gtk_tree_selection_get_selected(selection, &model, &iter)) return;
+
+    gchar *image_id = NULL;
+    gtk_tree_model_get(model, &iter, 0, &image_id, -1);
+    if (!image_id) {
+        g_free(image_id);
+        return;
+    }
+
     gtk_widget_show(data->spinner);
     gtk_spinner_start(GTK_SPINNER(data->spinner));
-    
-    const char *image_id = g_object_get_data(G_OBJECT(row), "image-id");
-    g_print("\n--- Row Selected: ID '%s' ---\n", image_id);
+
+    g_print("\n--- Tree Selection: ID '%s' ---\n", image_id);
     
     GError *error = NULL;
     GdkPixbuf *pixbuf = render_composite_image(data, image_id, &error);
@@ -31,6 +39,7 @@ void on_row_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_data) {
     
     gtk_spinner_stop(GTK_SPINNER(data->spinner));
     gtk_widget_hide(data->spinner);
+    g_free(image_id);
 }
 
 void on_scrolled_window_size_allocate(GtkWidget *widget, GdkRectangle *allocation, gpointer user_data) {

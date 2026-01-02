@@ -34,5 +34,5 @@ GdkPixbuf* load_pixbuf_from_memory(const gchar *buffer, gsize size, GError **err
 
 // UI helpers
 void scale_image_to_fit(AppData *data);
-void on_row_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_data);
+void on_tree_selection_changed(GtkTreeSelection *selection, gpointer user_data);
 void on_scrolled_window_size_allocate(GtkWidget *widget, GdkRectangle *allocation, gpointer user_data);
