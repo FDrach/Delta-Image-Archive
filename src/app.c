@@ -1,4 +1,5 @@
 #include "viewer.h"
+#include <ctype.h>
 
 static void copy_to_hashtable_cb(JsonObject *object, const gchar *member_name, JsonNode *member_node, gpointer user_data) {
     GHashTable *hash_table = (GHashTable*)user_data;
@@ -38,6 +39,59 @@ void debug_print_stored_data(AppData *data) {
         g_print("  ID '%s' -> Alpha file '%s'\n", (gchar*)key, (gchar*)value);
     }
     g_print("--- END OF VERIFICATION ---\n\n");
+}
+
+static gint natural_compare_strings(const gchar *a, const gchar *b) {
+    const gchar *p = a;
+    const gchar *q = b;
+    while (*p && *q) {
+        if (g_ascii_isdigit(*p) && g_ascii_isdigit(*q)) {
+            const gchar *p_start = p;
+            const gchar *q_start = q;
+
+            while (*p_start == '0') p_start++;
+            while (*q_start == '0') q_start++;
+
+            const gchar *p_end = p_start;
+            const gchar *q_end = q_start;
+            while (g_ascii_isdigit(*p_end)) p_end++;
+            while (g_ascii_isdigit(*q_end)) q_end++;
+
+            gint len_p = p_end - p_start;
+            gint len_q = q_end - q_start;
+            if (len_p != len_q)
+                return (len_p < len_q) ? -1 : 1;
+
+            gint cmp = g_strndup(p_start, len_p) ? memcmp(p_start, q_start, len_p) : 0;
+            if (cmp != 0)
+                return (cmp < 0) ? -1 : 1;
+
+            /* numbers equal, advance pointers past the digit sequences */
+            p = p_end;
+            q = q_end;
+            continue;
+        }
+
+        gint ca = g_ascii_tolower(*p);
+        gint cb = g_ascii_tolower(*q);
+        if (ca != cb)
+            return (ca < cb) ? -1 : 1;
+        p++;
+        q++;
+    }
+    if (!*p && !*q) return 0;
+    return (*p) ? 1 : -1;
+}
+
+static gint natural_compare(gconstpointer a, gconstpointer b, gpointer user_data) {
+    const gchar *id_a = (const gchar*)a;
+    const gchar *id_b = (const gchar*)b;
+    GHashTable *map = (GHashTable*)user_data;
+    const gchar *fa = g_hash_table_lookup(map, id_a);
+    const gchar *fb = g_hash_table_lookup(map, id_b);
+    if (!fa) fa = id_a;
+    if (!fb) fb = id_b;
+    return natural_compare_strings(fa, fb);
 }
 
 int on_command_line(GtkApplication *app, GApplicationCommandLine *cmdline, gpointer user_data) {
@@ -165,7 +219,7 @@ void activate(GtkApplication *app, gpointer user_data) {
     gtk_paned_set_position(GTK_PANED(paned), 200);
 
     GList *id_list = g_hash_table_get_keys(data->image_map);
-    id_list = g_list_sort(id_list, (GCompareFunc)g_strcmp0);
+    id_list = g_list_sort_with_data(id_list, (GCompareDataFunc)natural_compare, data->image_map);
     
     for (GList *l = id_list; l != NULL; l = l->next) {
         const gchar *image_id = (const gchar*)l->data;
